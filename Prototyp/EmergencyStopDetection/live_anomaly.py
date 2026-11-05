@@ -62,12 +62,12 @@ class TranAD(nn.Module):
 # Pfad-Auflösung (findet Desktop/models/mittel_w4 automatisch)
 # ======================================================================
 _BASE_DIR = Path(__file__).resolve().parent
-_DEFAULT_MODELS_DIR = _BASE_DIR.parent / "models"
+_DEFAULT_MODELS_DIR =  _BASE_DIR.parent / "models"
 
 DEFAULT_MODEL_ROOT = Path(os.path.expanduser(
     os.environ.get("LIFT_MODEL_ROOT", str(_DEFAULT_MODELS_DIR))
 ))
-PREFERRED_MODEL_NAME = os.environ.get("LIFT_MODEL_NAME", "mittel_w4")
+PREFERRED_MODEL_NAME = os.environ.get("LIFT_MODEL_NAME", "EmergencyStopAnomaly_medium_w4")
 
 
 def _is_run_dir(p: Path) -> bool:

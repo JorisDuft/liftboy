@@ -13,7 +13,7 @@ Output:
   --log-raw       (optional, nur --debug) : binäres Rolling-Ring
 
 Steuerung Tastatur:
-  p = Pause/Resume
+  p = Pause/Resume (auch zum Fortsetzen nach Anomalie!)
   r = Detektor-Reset (kurz pausieren)
   i = Info
 """
@@ -710,6 +710,8 @@ def load_sensor(mock=False):
 def main():
     ap = argparse.ArgumentParser()
     BASE_DIR = Path(__file__).parent.resolve()
+    
+    # Logs landen standardmäßig in Desktop/live_data/raw (so wie bei dir)
     DEFAULT_DATA_DIR = BASE_DIR.parent / "live_data" / "raw"
 
     ap.add_argument("--test", action="store_true")
@@ -726,8 +728,8 @@ def main():
     ap.add_argument("--debug", action="store_true")
 
     ap.add_argument("--anomaly-run-dir", type=Path, default=None,
-                    help="Run-Dir ODER Parent (z.B. C:\\ml_work\\models). "
-                         "Default: $LIFT_MODEL_ROOT oder C:\\ml_work\\models")
+                    help="Run-Dir ODER Parent (z.B. Desktop/models). "
+                         "Default: finde automatisch mittel_w4")
     ap.add_argument("--anomaly-model-name", type=str, default=None,
                     help="Bevorzugter Subdir-Name (Default: mittel_w4)")
     ap.add_argument("--threshold-factor", type=float, default=1.5)
@@ -811,7 +813,7 @@ def main():
                 pass
         return ctx
 
-    # --- Event-Handler: JSONL + Score + CMD ---
+    # --- Event-Handler: JSONL + Score + CMD + PAUSE BEI ANOMALIE ---
     def _on_event(ev, ride_id):
         seq = evt_logger.next_seq()
         ctx = _get_context()
@@ -825,14 +827,24 @@ def main():
                 "alarm": res["alarm"],
                 "warming_up": res["warming_up"],
             }
+            
             if res["alarm"]:
                 c, r = COLORS.get("alarm", ""), COLORS.get("reset", "")
-                print(f"  {c}[!] ANOMALIE ride=#{ride_id}  "
+                print(f"\n  {c}[!] ANOMALIE ride=#{ride_id}  "
                       f"score={res['score']:.4f} "
                       f"thr={res['threshold']:.4f}{r}")
                 if leds:
-                    leds.flash(StateLEDs.PINS and "fahren", 0.8)
+                    leds.flash("fahren", 0.8) # Kurzes Aufblitzen
 
+                # 1. Scorer anweisen, die kaputten Daten NICHT in den Normal-Pool zu übernehmen
+                aborted_summary = anomaly_scorer.discard_current_ride()
+                
+                # 2. Detector pausieren (ignoriert ab jetzt alle Sensordaten)
+                det.set_paused(True)
+                
+                # 3. Das Fahrt-Ende (mit der Anomalie) für die LLM loggen
+                det._report_ride_end(aborted=True, summary=aborted_summary)
+                
         record = {
             "kind": "event",
             "seq_idx": seq,
@@ -870,12 +882,11 @@ def main():
         })
     det.on_abort_marker = _on_abort_marker
 
-    # --- Ride-End: JSONL + CMD-Feedback ---
+    # --- Ride-End: JSONL + CMD-Feedback + PAUSE BEI ANOMALIE ---
     def _on_ride_end(ride_id, summary, aborted):
         seq = evt_logger.next_seq()
         tag = "ABORT" if aborted else "ENDE"
 
-        # CMD
         print("\n" + "=" * 62)
         print(f"  FAHRT #{ride_id} — {tag}")
         print("-" * 62)
@@ -895,9 +906,13 @@ def main():
                         if summary.get("accepted_into_pool")
                         else "→ verworfen (nicht in Pool)")
             print(f"  Normal-Pool : {pool_tag}")
+            
+            # Falls die Anomalie erst am Ende der Fahrt erkannt wurde
+            # (WICHTIG: det.paused check verhindert doppeltes Pausieren!)
+            if alarmed and not det.paused:
+                det.set_paused(True)
         print("=" * 62 + "\n")
 
-        # JSONL
         evt_logger.log({
             "kind": "ride_end",
             "seq_idx": seq,

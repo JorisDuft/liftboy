@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-start_lift.py — Master-Skript zum Starten des Lift-Systems.
-Prüft die Umgebung und startet den live_event_detector.
+start_liftboy.py — Master-Skript zum Starten des Lift-Systems.
+Prüft die Umgebung und startet den live_event_detector im Unterordner.
 """
 import subprocess
 import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-DETECTOR_SCRIPT = BASE_DIR / "live_event_detector.py"
+SUBDIR = BASE_DIR / "EmergencyStopDetection"
+DETECTOR_SCRIPT = SUBDIR / "live_event_detector.py"
+
+# WICHTIG: Fügt den Unterordner zum Suchpfad hinzu, damit der Import klappt
+sys.path.insert(0, str(SUBDIR))
 
 def check_environment():
     print("=" * 62)
