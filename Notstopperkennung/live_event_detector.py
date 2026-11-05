@@ -2,22 +2,25 @@
 """
 live_event_detector.py — Streaming-Event-Erkennung für den Lift.
 =================================================================
-Mit:
-- Fahrt-Abbruch (Watchdog)
-- Status-LEDs auf 4 GPIO-Pins (5, 6, 12, 13)
-- Software-Trigger: Tasten 'n', 'x', 'i', 'p', 'r', 'a'
-- Hardware-Taster (aktiv HIGH, externe 10k-Pulldowns):
-    GPIO 22 (Pin 15) = Nothalt markieren
-    GPIO 23 (Pin 16) = Pause/Resume
-- Live-Anomalie-Scoring (Sliding Window)
-- Fahrt-Report mit Ground Truth vs. Erkennung
-- Pause/Resume: Ignoriert unsaubere Phasen nach Nothalt
-- NEU: Setzt ride_id und seq_idx beim Neustart fort, ohne Marker zu löschen.
-"""
+TranAD-only Pipeline mit JSONL-Output für LLM (Qwen).
 
+Hardware:
+  LEDs:         GPIO 5=gestoppt, 6=anfahren, 12=fahren, 13=abbremsen
+  Taster:       GPIO 23 = Pause/Resume
+
+Output:
+  --events-jsonl  (Default events.jsonl)  : eine JSON-Zeile pro Event
+  --log-raw       (optional, nur --debug) : binäres Rolling-Ring
+
+Steuerung Tastatur:
+  p = Pause/Resume
+  r = Detektor-Reset (kurz pausieren)
+  i = Info
+"""
 import argparse
-import csv
 import json
+import os
+import struct
 import sys
 import threading
 import time
@@ -28,13 +31,6 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from stream_logger import StreamLogger
-    _HAS_STREAM_LOGGER = True
-except ImportError:
-    StreamLogger = None
-    _HAS_STREAM_LOGGER = False
-
-try:
     from gpiozero import LED, Button
     _HAS_GPIO = True
 except ImportError:
@@ -43,10 +39,12 @@ except ImportError:
     _HAS_GPIO = False
 
 try:
-    from live_anomaly import LiveAnomalyScorer
+    from live_anomaly import LiveAnomalyScorer, resolve_run_dir, MODEL_NAME
     _HAS_ANOMALY = True
 except ImportError:
     LiveAnomalyScorer = None
+    resolve_run_dir = None
+    MODEL_NAME = "tranad"
     _HAS_ANOMALY = False
 
 CFG = {
@@ -71,11 +69,7 @@ CFG = {
     "gestoppt_led_off_after_s": 10.0,
 }
 
-# Hardware-Taster (aktiv HIGH, externe 10k-Pulldowns gegen GND)
-BUTTON_PINS = {
-    "nothalt": 22,   # GPIO 22 (Pin 15)
-    "pause":   23,   # GPIO 23 (Pin 16)
-}
+BUTTON_PINS = {"pause": 23}
 
 COLORS = {
     "gestoppt":  "\033[90m",
@@ -87,24 +81,16 @@ COLORS = {
     "trigger":   "\033[96m",
     "alarm":     "\033[91m\033[1m",
     "ok":        "\033[92m",
+    "dim":       "\033[2m",
     "reset":     "\033[0m",
 }
 
 
 # ======================================================================
-# LED-Statusanzeige
+# LEDs
 # ======================================================================
 class StateLEDs:
-    PINS = {
-        "gestoppt":  5,
-        "anfahren":  6,
-        "fahren":    12,
-        "abbremsen": 13,
-    }
-    ANOMALY_LED = {
-        "gru_ae": "anfahren",
-        "tranad": "fahren",
-    }
+    PINS = {"gestoppt": 5, "anfahren": 6, "fahren": 12, "abbremsen": 13}
 
     def __init__(self, enabled=True, gestoppt_off_after_s=0.0):
         self.enabled = enabled and _HAS_GPIO
@@ -112,157 +98,95 @@ class StateLEDs:
         self.leds = {}
         self.current_state = None
         self.state_entered_t = None
-
         if self.enabled:
             try:
                 for state, pin in self.PINS.items():
                     self.leds[state] = LED(pin)
                 self._all_off()
             except Exception as e:
-                print(f"[!] LED-Init fehlgeschlagen: {e} — LEDs deaktiviert")
+                print(f"[!] LED-Init fehlgeschlagen: {e}")
                 self.enabled = False
                 self.leds = {}
 
     def _all_off(self):
         for led in self.leds.values():
-            try:
-                led.off()
-            except Exception:
-                pass
+            try: led.off()
+            except Exception: pass
 
     def set_state(self, state, now=None):
-        if not self.enabled:
-            return
+        if not self.enabled: return
         self.current_state = state
         self.state_entered_t = now if now is not None else time.time()
         for s, led in self.leds.items():
-            try:
-                led.on() if s == state else led.off()
-            except Exception:
-                pass
+            try: led.on() if s == state else led.off()
+            except Exception: pass
 
     def update(self, now=None):
-        if not self.enabled or self.current_state != "gestoppt":
-            return
-        if self.gestoppt_off_after_s <= 0 or self.state_entered_t is None:
-            return
+        if not self.enabled or self.current_state != "gestoppt": return
+        if self.gestoppt_off_after_s <= 0 or self.state_entered_t is None: return
         now = now if now is not None else time.time()
         if (now - self.state_entered_t) >= self.gestoppt_off_after_s:
-            try:
-                self.leds["gestoppt"].off()
-            except Exception:
-                pass
+            try: self.leds["gestoppt"].off()
+            except Exception: pass
 
     def blink(self, state, times=3, on_s=0.15, off_s=0.1):
-        if not self.enabled or state not in self.leds:
-            return
+        if not self.enabled or state not in self.leds: return
         led = self.leds[state]
         try:
             for _ in range(times):
                 led.on(); time.sleep(on_s); led.off(); time.sleep(off_s)
-        except Exception:
-            pass
+        except Exception: pass
 
-    def set_anomaly_status(self, model_name, is_anomaly):
-        if not self.enabled:
-            return
-        led_name = self.ANOMALY_LED.get(model_name)
-        if not led_name or led_name not in self.leds:
-            return
-        try:
-            self.leds[led_name].on() if is_anomaly else self.leds[led_name].off()
-        except Exception:
-            pass
-
-    def clear_anomaly_status(self):
-        if not self.enabled:
-            return
-        for led_name in set(self.ANOMALY_LED.values()):
-            if led_name in self.leds:
-                try:
-                    self.leds[led_name].off()
-                except Exception:
-                    pass
+    def flash(self, state, duration_s=0.8):
+        """Nicht-blockierendes Aufblitzen der Phase-LED (Anomalie-Anzeige)."""
+        if not self.enabled or state not in self.leds: return
+        led = self.leds[state]
+        def _run():
+            try:
+                led.on(); time.sleep(duration_s)
+                if self.current_state != state: led.off()
+            except Exception: pass
+        threading.Thread(target=_run, daemon=True).start()
 
     def close(self):
-        if not self.enabled:
-            return
+        if not self.enabled: return
         self._all_off()
         for led in self.leds.values():
-            try:
-                led.close()
-            except Exception:
-                pass
+            try: led.close()
+            except Exception: pass
 
 
 # ======================================================================
-# Software-Trigger + Hardware-Taster
+# Steuerung — nur Pause/Reset
 # ======================================================================
-class TestTrigger:
-    def __init__(self, marker_path: Path, session_id=None, enabled=True,
-                 on_force_alarm=None, on_pause=None, on_reset=None,
+class ControlPanel:
+    def __init__(self, enabled=True, on_pause=None, on_reset=None,
                  use_hardware_buttons=False):
-        self.marker_path = Path(marker_path)
-        self.session_id = session_id
         self.enabled = enabled and self._can_read_keyboard()
-        self.next_ride_is_test = False
-        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
-        self.marked_rides = []
-
-        self.on_force_alarm = on_force_alarm
         self.on_pause = on_pause
         self.on_reset = on_reset
-
-        # --- Hardware-Taster (aktiv HIGH, externe 10k-Pulldowns) ---
         self.buttons = {}
+
         if use_hardware_buttons and _HAS_GPIO and Button is not None:
             try:
-                btn_nothalt = Button(
-                    BUTTON_PINS["nothalt"],
-                    pull_up=False,   # externer 10k-Pulldown
-                    bounce_time=0.2,
-                )
-                btn_nothalt.when_pressed = self._hw_nothalt_pressed
-                self.buttons["nothalt"] = btn_nothalt
-
-                btn_pause = Button(
-                    BUTTON_PINS["pause"],
-                    pull_up=False,
-                    bounce_time=0.2,
-                )
-                btn_pause.when_pressed = self._hw_pause_pressed
-                self.buttons["pause"] = btn_pause
-
-                print(f"[i] Hardware-Taster: AN (aktiv HIGH, externe Pulldowns)")
-                print(f"    GPIO {BUTTON_PINS['nothalt']} = Nothalt markieren")
-                print(f"    GPIO {BUTTON_PINS['pause']}   = Pause/Resume")
+                btn = Button(BUTTON_PINS["pause"],
+                             pull_up=False, bounce_time=0.2)
+                btn.when_pressed = self._hw_pause
+                self.buttons["pause"] = btn
+                print(f"[i] HW-Taster: GPIO {BUTTON_PINS['pause']} = Pause/Resume")
             except Exception as e:
-                print(f"[!] Hardware-Taster-Init fehlgeschlagen: {e}")
-                self.buttons = {}
+                print(f"[!] HW-Taster-Init: {e}")
 
         if self.enabled:
-            self.marker_path.parent.mkdir(parents=True, exist_ok=True)
-            # FIX: Wir überschreiben die Datei nicht mehr, sondern legen sie nur an, falls sie fehlt
-            if not self.marker_path.exists():
-                self.marker_path.touch()
             self._thread = threading.Thread(target=self._listen, daemon=True)
             self._thread.start()
 
-    def _hw_nothalt_pressed(self):
-        c = COLORS.get("trigger", "")
-        r = COLORS.get("reset", "")
-        with self._lock:
-            self.next_ride_is_test = True
-        print(f"\n  {c}[HW-TASTER] Nächste Fahrt wird als NOTHALT markiert{r}\n")
-
-    def _hw_pause_pressed(self):
-        c = COLORS.get("trigger", "")
-        r = COLORS.get("reset", "")
-        if self.on_pause is not None:
-            self.on_pause()
-        print(f"\n  {c}[HW-TASTER] Pause/Resume{r}\n")
+    def _hw_pause(self):
+        c, r = COLORS.get("trigger", ""), COLORS.get("reset", "")
+        if self.on_pause: self.on_pause()
+        print(f"\n  {c}[HW] Pause/Resume{r}\n")
 
     @staticmethod
     def _can_read_keyboard():
@@ -301,75 +225,91 @@ class TestTrigger:
             finally:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
         except Exception as e:
-            print(f"[!] Trigger-Listener beendet: {e}")
+            print(f"[!] Key-Listener beendet: {e}")
 
     def _handle_key(self, ch):
         c, r = COLORS.get("trigger", ""), COLORS.get("reset", "")
-        if ch == "n":
-            with self._lock:
-                already = self.next_ride_is_test
-                self.next_ride_is_test = True
-            print(f"\n  {c}[TRIGGER] Nächste Fahrt NOTHALT{r}\n" if not already
-                  else f"\n  {c}[TRIGGER] Flag bereits gesetzt{r}\n")
-        elif ch == "x":
-            with self._lock:
-                was = self.next_ride_is_test
-                self.next_ride_is_test = False
-            print(f"\n  {c}[TRIGGER] Markierung "
-                  f"{'aufgehoben' if was else 'nicht aktiv'}{r}\n")
-        elif ch == "i":
-            with self._lock:
-                flag = self.next_ride_is_test
-            print(f"\n  {c}[TRIGGER] next_ride_is_test={flag} | "
-                  f"markiert: {len(self.marked_rides)}{r}\n")
-        elif ch == "a":
-            if self.on_force_alarm:
-                self.on_force_alarm()
-                print(f"\n  {c}[TRIGGER] Manuelle Anomalie (Test){r}\n")
-        elif ch == "p":
-            if self.on_pause is not None:
-                self.on_pause()
+        if ch == "p":
+            if self.on_pause: self.on_pause()
         elif ch == "r":
-            if self.on_reset is not None:
-                self.on_reset()
-
-    def consume_flag(self):
-        with self._lock:
-            flag = self.next_ride_is_test
-            self.next_ride_is_test = False
-        return flag
-
-    def mark_ride(self, ride_id, ride_start_unix):
-        if not self.enabled:
-            return
-        record = {
-            "ride_id": int(ride_id),
-            "type": "nothalt",
-            "session_id": self.session_id,
-            "start_unix": float(ride_start_unix),
-            "marked_unix": float(time.time()),
-        }
-        self.marked_rides.append(int(ride_id))
-        with open(self.marker_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-            f.flush()
+            if self.on_reset: self.on_reset()
+        elif ch == "i":
+            print(f"\n  {c}[INFO] 'p'=Pause/Resume  'r'=Reset{r}\n")
 
     def close(self):
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
+        if self._thread: self._thread.join(timeout=1.0)
         for btn in self.buttons.values():
-            try:
-                btn.close()
-            except Exception:
-                pass
+            try: btn.close()
+            except Exception: pass
+
+
+# ======================================================================
+# JSONL Event-Logger (append-only, LLM-freundlich)
+# ======================================================================
+class EventLogger:
+    def __init__(self, path: Path, session_id=None, resume=True):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.seq_idx = 0
+        self.ride_id = 0
+        if resume and self.path.exists() and self.path.stat().st_size > 0:
+            self._resume()
+        self._f = open(self.path, "a", encoding="utf-8")
+
+    def _resume(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    try: ev = json.loads(line)
+                    except json.JSONDecodeError: continue
+                    if "seq_idx" in ev:
+                        self.seq_idx = max(self.seq_idx, int(ev["seq_idx"]))
+                    if "ride_id" in ev:
+                        self.ride_id = max(self.ride_id, int(ev["ride_id"]))
+            print(f"[i] Event-Log fortgesetzt: seq={self.seq_idx}, "
+                  f"ride={self.ride_id}")
+        except Exception as e:
+            print(f"[!] Resume-Fehler: {e}")
+
+    def next_seq(self):
+        s = self.seq_idx; self.seq_idx += 1
+        return s
+
+    def log(self, record: dict):
+        self._f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._f.flush()
+
+    def close(self):
+        if self._f and not self._f.closed:
+            self._f.flush(); self._f.close()
+
+
+# ======================================================================
+# Optionaler binärer Raw-Logger (nur mit --debug)
+# ======================================================================
+class BinaryRawLogger:
+    """8 Byte/Sample: <float32 z> <float32 t_rel>. Kein Header."""
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self._f = open(path, "wb")
+
+    def log(self, z, t_rel):
+        self._f.write(struct.pack("<ff", float(z), float(t_rel)))
+
+    def close(self):
+        self._f.close()
 
 
 # ======================================================================
 # Detektor
 # ======================================================================
 class LiveEventDetector:
-    def __init__(self, cfg=None, leds=None, test_trigger=None):
+    def __init__(self, cfg=None, leds=None, control=None):
         self.cfg = cfg or CFG
         fs = self.cfg["fs"]
         self.fs = fs
@@ -382,7 +322,6 @@ class LiveEventDetector:
 
         self.env_window = max(int(fs * self.cfg["env_s"]), 5)
         self.lowpass_window = max(int(fs * self.cfg["lowpass_s"]), 3)
-        self.high_buf = deque(maxlen=self.env_window)
 
         self.state = "gestoppt"
         self.state_start_t = None
@@ -396,7 +335,6 @@ class LiveEventDetector:
 
         self.pending_state = None
         self.pending_since_t = None
-
         self.env_buffer = []
 
         self.stop_thresh = self.cfg["stop_thresh_default"]
@@ -417,81 +355,56 @@ class LiveEventDetector:
         self.on_ride_end = None
 
         self.paused = False
-
-        self.anomaly_models = []
-        self.ride_alarm_status = {}
-        self.ride_ground_truth = {}
-        self._last_reported_ride = None
-
-        self.stats = {}
-
-        self.n_rides_ok = 0
-        self.n_rides_aborted = 0
-        
+        self.anomaly_scorer = None
         self._ride_end_logged = False
 
         self.leds = leds
-        self.test_trigger = test_trigger
+        self.control = control
+
+        self.n_rides_ok = 0
+        self.n_rides_aborted = 0
+        self.n_rides_anomal = 0
 
     def _set_leds(self, state):
-        if self.leds is not None:
-            self.leds.set_state(state, now=time.time())
-
-    def report_alarm(self, model_name):
-        if model_name in self.ride_alarm_status:
-            self.ride_alarm_status[model_name] = True
+        if self.leds: self.leds.set_state(state, now=time.time())
 
     def set_paused(self, paused: bool):
         self.paused = paused
-        if paused:
-            self.buf_x.clear(); self.buf_y.clear()
-            self.buf_z.clear(); self.buf_t.clear()
-            self.env_buffer.clear()
-            self.current_events = []
-            self.state = "gestoppt"
-            self.state_start_t = time.time()
-            self.last_stop_t = time.time()
-            self.pending_state = None
-            self.pending_since_t = None
-            self._ride_end_logged = True
-            if self.leds is not None:
-                self.leds._all_off()
-            c, r = COLORS.get("watchdog", ""), COLORS.get("reset", "")
-            print(f"\n  {c}⏸  PAUSE AKTIV — Events werden ignoriert{r}\n")
-        else:
-            self.buf_x.clear(); self.buf_y.clear()
-            self.buf_z.clear(); self.buf_t.clear()
-            self.env_buffer.clear()
-            self.current_events = []
-            self.state = "gestoppt"
-            now = time.time()
-            self.state_start_t = now
-            self.last_stop_t = now
-            self.pending_state = None
-            self.pending_since_t = None
-            self._ride_end_logged = True
-            if self.leds is not None:
-                self.leds.set_state("gestoppt", now=now)
-                self.leds.clear_anomaly_status()
-            c, r = COLORS.get("ok", ""), COLORS.get("reset", "")
-            print(f"\n  {c}▶  RESUME — Detektor zurückgesetzt{r}\n")
+        self._clear_buffers()
+        self.state = "gestoppt"
+        now = time.time()
+        self.state_start_t = now
+        self.last_stop_t = now
+        self._ride_end_logged = True
+        if self.leds:
+            if paused: self.leds._all_off()
+            else: self.leds.set_state("gestoppt", now=now)
+        c, r = COLORS.get("watchdog" if paused else "ok", ""), COLORS.get("reset", "")
+        print(f"\n  {c}{'⏸  PAUSE AKTIV' if paused else '▶  RESUME'}{r}\n")
 
+    def _clear_buffers(self):
+        self.buf_x.clear(); self.buf_y.clear()
+        self.buf_z.clear(); self.buf_t.clear()
+        self.env_buffer.clear()
+        self.current_events = []
+        self.pending_state = None
+        self.pending_since_t = None
+
+    # ------------------------------------------------------------------
+    # Sensor-Feed
+    # ------------------------------------------------------------------
     def feed(self, x, y, z, timestamp):
-        if self.paused:
-            return
+        if self.paused: return
         self.buf_x.append(x); self.buf_y.append(y)
         self.buf_z.append(z); self.buf_t.append(timestamp)
 
-        n = len(self.buf_x)
-        if n < self.env_window + self.lowpass_window + 5:
+        if len(self.buf_x) < self.env_window + self.lowpass_window + 5:
             return
 
         if self.axis is None:
-            stds = {
-                "x": float(np.std(self.buf_x)),
-                "y": float(np.std(self.buf_y)),
-                "z": float(np.std(self.buf_z)),
-            }
+            stds = {"x": float(np.std(self.buf_x)),
+                    "y": float(np.std(self.buf_y)),
+                    "z": float(np.std(self.buf_z))}
             self.axis = max(stds, key=stds.get)
             if self.print_events:
                 print(f"[i] Hauptachse (auto): {self.axis.upper()}")
@@ -507,22 +420,20 @@ class LiveEventDetector:
                     self.calibration_start_t = timestamp
                 ac = raw - np.mean(raw)
                 if len(ac) >= self.lowpass_window:
-                    kernel = np.ones(self.lowpass_window) / self.lowpass_window
-                    low = np.convolve(ac, kernel, mode="valid")
-                else:
-                    low = ac
-                low_env = float(np.mean(np.abs(low[-self.env_window:])))
-                self.cal_samples.append(low_env)
+                    k = np.ones(self.lowpass_window) / self.lowpass_window
+                    low = np.convolve(ac, k, mode="valid")
+                else: low = ac
+                self.cal_samples.append(
+                    float(np.mean(np.abs(low[-self.env_window:])))
+                )
                 if (timestamp - self.calibration_start_t) >= self.cfg["calibration_s"]:
                     self._finish_calibration(timestamp)
             return
 
         raw_ac = raw - self.offset
-        if len(raw_ac) < self.lowpass_window:
-            return
-
-        kernel = np.ones(self.lowpass_window) / self.lowpass_window
-        low_series = np.convolve(raw_ac, kernel, mode="valid")
+        if len(raw_ac) < self.lowpass_window: return
+        k = np.ones(self.lowpass_window) / self.lowpass_window
+        low_series = np.convolve(raw_ac, k, mode="valid")
         low_env = float(np.mean(np.abs(low_series[-self.env_window:])))
 
         if self.print_debug:
@@ -531,35 +442,30 @@ class LiveEventDetector:
         if self.calibrated or self.calibration_failed:
             self.env_buffer.append(low_env)
 
-        if self._check_watchdog(timestamp):
-            return
-
+        if self._check_watchdog(timestamp): return
         self._update_state(low_env, timestamp)
 
+    # ------------------------------------------------------------------
+    # Watchdog
+    # ------------------------------------------------------------------
     def _check_watchdog(self, timestamp):
         if self.state == "gestoppt" or self.state_start_t is None:
             return False
-        max_dur = self.cfg["max_duration_s"].get(self.state, None)
-        if max_dur is None:
-            return False
+        max_dur = self.cfg["max_duration_s"].get(self.state)
+        if max_dur is None: return False
         elapsed = timestamp - self.state_start_t
-        if elapsed <= max_dur:
-            return False
+        if elapsed <= max_dur: return False
         self._abort_ride(
             reason=f"{self.state} dauerte {elapsed:.1f}s (max {max_dur:.0f}s)",
-            timestamp=timestamp,
-        )
+            timestamp=timestamp)
         return True
 
     def _emit_event(self, ev, ride_id):
-        if self.paused:
-            return
-        if self.on_event:
-            self.on_event(ev, ride_id)
+        if self.paused: return
+        if self.on_event: self.on_event(ev, ride_id)
 
     def _write_active_event_on_abort(self, timestamp, ride_id):
-        if self.state == "gestoppt" or self.state_start_t is None:
-            return
+        if self.state == "gestoppt" or self.state_start_t is None: return
         ev_dur = timestamp - self.state_start_t
         env_mean, env_max, env_std, n_samples, peak_pos_rel = self._env_stats()
         ev = {
@@ -573,41 +479,40 @@ class LiveEventDetector:
         if self.print_events:
             print(f"  {COLORS.get(self.state, '')}"
                   f"[{datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')}] "
-                  f"{self.state:<10} ({ev_dur:5.2f}s) [ABORT]"
-                  f"{COLORS['reset']}")
+                  f"{self.state:<10} ({ev_dur:5.2f}s) [ABORT]{COLORS['reset']}")
 
     def _write_abort_marker(self, ride_id, reason):
-        ev = {
-            "type": "ABORT", "start_t": time.time(), "end_t": time.time(),
-            "duration_s": 0.0, "env_mean": 0.0, "env_max": 0.0,
-            "env_std": 0.0, "n_samples": 0, "peak_pos_rel": 0.0,
-            "aborted": 1, "reason": reason,
-        }
-        if self.on_abort_marker:
-            self.on_abort_marker(ev, ride_id, reason)
+        ev = {"type": "ABORT", "start_t": time.time(), "end_t": time.time(),
+              "duration_s": 0.0, "env_mean": 0.0, "env_max": 0.0,
+              "env_std": 0.0, "n_samples": 0, "peak_pos_rel": 0.0,
+              "aborted": 1, "reason": reason}
+        if self.on_abort_marker: self.on_abort_marker(ev, ride_id, reason)
 
-    def _report_ride_end(self, aborted: bool):
-        if self.ride_id == 0 or self.ride_id == self._last_reported_ride:
-            return
-        self._last_reported_ride = self.ride_id
+    def _report_ride_end(self, aborted: bool, summary=None):
         if self.on_ride_end:
-            self.on_ride_end(self.ride_id, dict(self.ride_alarm_status), aborted)
+            self.on_ride_end(self.ride_id, summary, aborted)
 
+    # ------------------------------------------------------------------
+    # Abbruch
+    # ------------------------------------------------------------------
     def _abort_ride(self, reason, timestamp=None):
-        if timestamp is None:
-            timestamp = time.time()
+        if timestamp is None: timestamp = time.time()
         if self.print_events:
             print(f"\n  {COLORS['watchdog']}"
                   f"[{datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')}] "
-                  f"⚠ WATCHDOG — Fahrt #{self.ride_id} abgebrochen"
-                  f"{COLORS['reset']}")
-            print(f"  {COLORS['watchdog']}         Grund: {reason}"
-                  f"{COLORS['reset']}")
-        if self.leds is not None:
-            self.leds.blink("gestoppt", times=3)
+                  f"⚠ WATCHDOG — Fahrt #{self.ride_id} abgebrochen{COLORS['reset']}")
+            print(f"  {COLORS['watchdog']}         Grund: {reason}{COLORS['reset']}")
+        if self.leds: self.leds.blink("gestoppt", times=3)
+
         self._write_active_event_on_abort(timestamp, self.ride_id)
         self._write_abort_marker(self.ride_id, reason)
-        self._report_ride_end(aborted=True)
+
+        summary = None
+        if self.anomaly_scorer is not None:
+            summary = self.anomaly_scorer.discard_current_ride()
+
+        self._report_ride_end(aborted=True, summary=summary)
+
         self.current_events = []
         self.env_buffer.clear()
         self.state = "gestoppt"
@@ -623,63 +528,45 @@ class LiveEventDetector:
         buf = self.env_buffer
         if buf:
             arr = np.asarray(buf, dtype=float)
-            return (
-                float(arr.mean()), float(arr.max()),
-                float(arr.std()), int(len(arr)),
-                float(np.argmax(arr) / max(len(arr) - 1, 1)),
-            )
+            return (float(arr.mean()), float(arr.max()), float(arr.std()),
+                    int(len(arr)), float(np.argmax(arr) / max(len(arr) - 1, 1)))
         return 0.0, 0.0, 0.0, 0, 0.0
 
+    # ------------------------------------------------------------------
+    # Kalibrierung
+    # ------------------------------------------------------------------
     def _finish_calibration(self, timestamp):
-        if self._cal_offset_samples:
-            self.offset = float(np.mean(self._cal_offset_samples))
-        else:
-            self.offset = 0.0
-
+        self.offset = float(np.mean(self._cal_offset_samples)) if self._cal_offset_samples else 0.0
         samples = np.array(self.cal_samples)
         if len(samples) < 10:
             self.calibration_failed = True
-            if self.print_events:
-                print("[!] Kalibrierung fehlgeschlagen — Default-Thresholds")
-                print(f"    offset={self.offset:.4f}")
-                print(f"    enter={self.enter_thresh:.4f}  exit={self.exit_thresh:.4f}")
-            self.state_start_t = timestamp
-            self.last_stop_t = timestamp
-            self._set_leds(self.state)
-            return
-
-        p90 = float(np.percentile(samples, 90))
-
-        if p90 > 0.15:
-            self.calibration_failed = True
-            if self.print_events:
-                print(f"[!] Kalibrierung ungültig (p90={p90:.4f} > 0.15)")
-                print(f"    offset={self.offset:.4f}")
-                print(f"    enter={self.enter_thresh:.4f}  exit={self.exit_thresh:.4f}")
         else:
-            self.stop_thresh = max(p90 * 1.5, 0.01)
-            self.peak_thresh = self.stop_thresh * self.cfg["peak_thresh_factor"]
-            self.enter_thresh = self.peak_thresh * self.cfg["enter_factor"]
-            self.exit_thresh = self.peak_thresh * self.cfg["exit_factor"]
-            self.calibrated = True
+            p90 = float(np.percentile(samples, 90))
+            if p90 > 0.15:
+                self.calibration_failed = True
+            else:
+                self.stop_thresh = max(p90 * 1.5, 0.01)
+                self.peak_thresh = self.stop_thresh * self.cfg["peak_thresh_factor"]
+                self.enter_thresh = self.peak_thresh * self.cfg["enter_factor"]
+                self.exit_thresh = self.peak_thresh * self.cfg["exit_factor"]
+                self.calibrated = True
 
         if self.print_events:
             print(f"[i] Kalibrierung {'OK' if self.calibrated else 'FEHLGESCHLAGEN'}")
             print(f"    offset={self.offset:.4f}")
             print(f"    stop={self.stop_thresh:.4f}  peak={self.peak_thresh:.4f}")
             print(f"    enter={self.enter_thresh:.4f}  exit={self.exit_thresh:.4f}")
-            print(f"    Watchdog: anfahren≤{self.cfg['max_duration_s']['anfahren']:.0f}s  "
-                  f"fahren≤{self.cfg['max_duration_s']['fahren']:.0f}s  "
-                  f"abbremsen≤{self.cfg['max_duration_s']['abbremsen']:.0f}s")
 
         self.state_start_t = timestamp
         self.last_stop_t = timestamp
         self._set_leds(self.state)
 
+    # ------------------------------------------------------------------
+    # State machine
+    # ------------------------------------------------------------------
     def _update_state(self, low_env, timestamp):
         prev = self.state
-        candidate = None
-        confirm_s = 0.0
+        candidate = None; confirm_s = 0.0
 
         if prev == "gestoppt" and low_env > self.enter_thresh:
             candidate, confirm_s = "anfahren", self.cfg["confirm_anfahren_s"]
@@ -691,19 +578,15 @@ class LiveEventDetector:
             candidate, confirm_s = "gestoppt", self.cfg["confirm_abbremsen_s"]
 
         if candidate is None or candidate == prev:
-            self.pending_state = None
-            self.pending_since_t = None
+            self.pending_state = None; self.pending_since_t = None
             return
-
         if candidate != self.pending_state:
             self.pending_state = candidate
             self.pending_since_t = timestamp
             return
-
         if (timestamp - self.pending_since_t) >= confirm_s:
             self._transition(prev, candidate, timestamp, low_env)
-            self.pending_state = None
-            self.pending_since_t = None
+            self.pending_state = None; self.pending_since_t = None
 
     def _transition(self, prev, new, timestamp, low_env):
         if prev == "gestoppt" and new != "gestoppt":
@@ -713,35 +596,11 @@ class LiveEventDetector:
                     print(f"  {COLORS.get(prev, '')}"
                           f"[{datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')}] "
                           f"{prev:<10} ({ev_dur:5.2f}s){COLORS['reset']}")
-
             self.current_events = []
             self.ride_id += 1
             self._ride_end_logged = False
-
-            is_test_ride = False
-            if self.test_trigger is not None and self.test_trigger.consume_flag():
-                self.test_trigger.mark_ride(self.ride_id, timestamp)
-                is_test_ride = True
-            self.ride_ground_truth[self.ride_id] = (
-                "nothalt" if is_test_ride else "normal"
-            )
-
-            self.ride_alarm_status = {
-                name: False for name in self.anomaly_models
-            }
-            self._last_reported_ride = None
-
-            if self.leds is not None:
-                self.leds.clear_anomaly_status()
-
             if self.print_events:
-                if is_test_ride:
-                    c, r = COLORS.get("trigger", ""), COLORS.get("reset", "")
-                    print(f"\n  {c}!!!!!!!! TESTFAHRT #{self.ride_id} (Nothalt) !!!!!!!!{r}")
-                    print(f"  {c}[=== Fahrt #{self.ride_id} startet ===]{r}\n")
-                else:
-                    print(f"\n  [=== Fahrt #{self.ride_id} startet ===]\n")
-
+                print(f"\n  [=== Fahrt #{self.ride_id} startet ===]\n")
             self.state = new
             self.state_start_t = timestamp
             self.env_buffer.clear()
@@ -755,20 +614,15 @@ class LiveEventDetector:
                 self.state_start_t = timestamp
                 self.env_buffer.clear()
                 self._set_leds(new)
-                if new == "gestoppt":
-                    self.last_stop_t = timestamp
+                if new == "gestoppt": self.last_stop_t = timestamp
                 return
-
             env_mean, env_max, env_std, n_samples, peak_pos_rel = self._env_stats()
-            ev = {
-                "type": prev, "start_t": self.state_start_t,
-                "end_t": timestamp, "duration_s": ev_dur,
-                "env_mean": env_mean, "env_max": env_max,
-                "env_std": env_std, "n_samples": n_samples,
-                "peak_pos_rel": peak_pos_rel, "aborted": 0,
-            }
+            ev = {"type": prev, "start_t": self.state_start_t,
+                  "end_t": timestamp, "duration_s": ev_dur,
+                  "env_mean": env_mean, "env_max": env_max,
+                  "env_std": env_std, "n_samples": n_samples,
+                  "peak_pos_rel": peak_pos_rel, "aborted": 0}
             self._emit_event(ev, self.ride_id)
-
             if self.print_events:
                 print(f"  {COLORS.get(prev, '')}"
                       f"[{datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')}] "
@@ -779,43 +633,39 @@ class LiveEventDetector:
         self.state_start_t = timestamp
         self.env_buffer.clear()
         self._set_leds(new)
-        if new == "gestoppt":
-            self.last_stop_t = timestamp
+        if new == "gestoppt": self.last_stop_t = timestamp
 
     def check_ride_end(self, timestamp):
-        if self.paused:
-            return
-        if not (self.calibrated or self.calibration_failed):
-            return
-        if self.state != "gestoppt" or self.last_stop_t is None:
-            return
-        if self.ride_id == 0:
-            return
-        if self._ride_end_logged:
-            return
-        if (timestamp - self.last_stop_t) < self.cfg["min_stop_duration_s"]:
-            return
+        if self.paused: return
+        if not (self.calibrated or self.calibration_failed): return
+        if self.state != "gestoppt" or self.last_stop_t is None: return
+        if self.ride_id == 0: return
+        if self._ride_end_logged: return
+        if (timestamp - self.last_stop_t) < self.cfg["min_stop_duration_s"]: return
 
         env_mean, env_max, env_std, n_samples, peak_pos_rel = self._env_stats()
-        ev = {
-            "type": "gestoppt", "start_t": self.state_start_t,
-            "end_t": timestamp,
-            "duration_s": timestamp - self.state_start_t,
-            "env_mean": env_mean, "env_max": env_max,
-            "env_std": env_std, "n_samples": n_samples,
-            "peak_pos_rel": peak_pos_rel, "aborted": 0,
-        }
+        ev = {"type": "gestoppt", "start_t": self.state_start_t,
+              "end_t": timestamp,
+              "duration_s": timestamp - self.state_start_t,
+              "env_mean": env_mean, "env_max": env_max,
+              "env_std": env_std, "n_samples": n_samples,
+              "peak_pos_rel": peak_pos_rel, "aborted": 0}
         self._emit_event(ev, self.ride_id)
 
         if self.print_events:
             print(f"  {COLORS['gestoppt']}"
                   f"[{datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')}] "
-                  f"{'gestoppt':<10} ({ev['duration_s']:5.2f}s)"
-                  f"{COLORS['reset']}")
-            print(f"  [=== Fahrt #{self.ride_id} beendet ===]\n")
+                  f"{'gestoppt':<10} ({ev['duration_s']:5.2f}s){COLORS['reset']}")
+
+        summary = None
+        if self.anomaly_scorer is not None:
+            summary = self.anomaly_scorer.finalize_current_ride()
 
         self.n_rides_ok += 1
-        self._report_ride_end(aborted=False)
+        if summary and summary.get("alarmed"):
+            self.n_rides_anomal += 1
+
+        self._report_ride_end(aborted=False, summary=summary)
 
         self.state_start_t = timestamp
         self.last_stop_t = timestamp
@@ -854,39 +704,6 @@ def load_sensor(mock=False):
     return LIS2DW12()
 
 
-class RawLogger:
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.f = open(path, "w", newline="")
-        self.w = csv.writer(self.f)
-        self.w.writerow(["timestamp", "t_rel", "x", "y", "z"])
-    def log(self, ts, tr, x, y, z):
-        self.w.writerow([f"{ts:.6f}", f"{tr:.6f}",
-                         f"{x:.6f}", f"{y:.6f}", f"{z:.6f}"])
-    def close(self): self.f.close()
-
-# ======================================================================
-# Helfer zum Lesen der letzten IDs
-# ======================================================================
-def get_last_ids(events_path: Path):
-    last_ride = 0
-    last_seq = 0
-    if events_path.exists():
-        try:
-            with open(events_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    rid = row.get("ride_id")
-                    if rid and str(rid).strip().isdigit():
-                        last_ride = int(rid)
-                    seq = row.get("seq_idx")
-                    if seq and str(seq).strip().isdigit():
-                        last_seq = int(seq)
-        except Exception as e:
-            print(f"[!] Fehler beim Lesen der letzten IDs: {e}")
-    return last_seq, last_ride
-
-
 # ======================================================================
 # Main
 # ======================================================================
@@ -897,182 +714,204 @@ def main():
 
     ap.add_argument("--test", action="store_true")
     ap.add_argument("--axis", choices=["x", "y", "z", "auto"], default="z")
-    ap.add_argument("--log-raw", type=Path,
-                    default=DEFAULT_DATA_DIR / "stream_raw.csv")
-    ap.add_argument("--log-events", type=Path,
-                    default=DEFAULT_DATA_DIR / "stream_events.csv")
-    ap.add_argument("--test-markers", type=Path, default=None)
-    ap.add_argument("--no-trigger", action="store_true")
-    ap.add_argument("--no-stream-logger", action="store_true")
+    ap.add_argument("--events-jsonl", type=Path,
+                    default=DEFAULT_DATA_DIR / "events.jsonl")
+    ap.add_argument("--log-raw", type=Path, default=None,
+                    help="Binäres Rolling-Ring (nur mit --debug sinnvoll)")
+    ap.add_argument("--context-file", type=Path, default=None,
+                    help="JSON mit externem Kontext (Tür, Waage, ...)")
+    ap.add_argument("--no-control", action="store_true")
     ap.add_argument("--no-leds", action="store_true")
-    ap.add_argument("--no-buttons", action="store_true",
-                    help="Hardware-Taster (GPIO 22/23) deaktivieren")
+    ap.add_argument("--no-buttons", action="store_true")
     ap.add_argument("--debug", action="store_true")
 
-    ap.add_argument("--anomaly-run-dir", type=Path, default=None)
-    ap.add_argument("--anomaly-models", type=str, default="gru_ae,tranad")
-    ap.add_argument("--score-log", type=Path, default=None)
+    ap.add_argument("--anomaly-run-dir", type=Path, default=None,
+                    help="Run-Dir ODER Parent (z.B. C:\\ml_work\\models). "
+                         "Default: $LIFT_MODEL_ROOT oder C:\\ml_work\\models")
+    ap.add_argument("--anomaly-model-name", type=str, default=None,
+                    help="Bevorzugter Subdir-Name (Default: mittel_w4)")
+    ap.add_argument("--threshold-factor", type=float, default=1.5)
+    ap.add_argument("--confirmation-events", type=int, default=1)
+    ap.add_argument("--accept-below-ratio", type=float, default=0.75,
+                    help="max_score < threshold × ratio → Fahrt in Pool")
 
     args = ap.parse_args()
 
-    if args.test_markers is None:
-        args.test_markers = Path(args.log_events).parent / "test_markers.jsonl"
-    if args.score_log is None:
-        args.score_log = Path(args.log_events).parent / "live_scores.csv"
-
     print("=" * 62)
-    print("  Live Event Detector")
+    print("  Live Event Detector — TranAD-only")
     print("=" * 62)
-    print(f"  Modus: {'MOCK' if args.test else 'LIVE'}")
+    print(f"  Modus:    {'MOCK' if args.test else 'LIVE'}")
     print(f"  Sampling: {CFG['fs']} Hz")
-    print(f"  Achse: {args.axis.upper() if args.axis != 'auto' else 'AUTO'}")
+    print(f"  Achse:    {args.axis.upper() if args.axis != 'auto' else 'AUTO'}")
     print(f"  Beenden mit Strg+C\n")
 
+    # --- LEDs ---
     leds = None if args.no_leds else StateLEDs(
-        enabled=True,
-        gestoppt_off_after_s=CFG["gestoppt_led_off_after_s"],
-    )
+        enabled=True, gestoppt_off_after_s=CFG["gestoppt_led_off_after_s"])
     if leds and leds.enabled:
-        print(f"  LEDs: an  (gestoppt=GPIO5, anfahren=GPIO6, "
-              f"fahren=GPIO12, abbremsen=GPIO13)")
-        print(f"        Nach Fahrt: GPIO6=GRU-AE, GPIO12=TranAD")
+        print("  LEDs: an  (5=gestoppt, 6=anfahren, 12=fahren, 13=abbremsen)")
     else:
         print("  LEDs: aus")
 
+    # --- Sensor ---
     try:
         sensor = load_sensor(mock=args.test)
     except SystemExit as e:
         if leds: leds.close()
         print(e); return
 
-    cfg = dict(CFG)
-    det = LiveEventDetector(cfg, leds=leds)
+    # --- Event-Logger ---
+    evt_logger = EventLogger(args.events_jsonl, resume=True)
+    print(f"[i] Event-Log: {evt_logger.path}")
+
+    # --- Detektor ---
+    det = LiveEventDetector(dict(CFG), leds=leds)
     det.print_events = True
     det.print_debug = args.debug
-
-    # --- NEU: Letzte IDs auslesen und fortsetzen ---
-    last_seq, last_ride = get_last_ids(args.log_events)
-    det.ride_id = last_ride
-    print(f"[i] Setze ride_id fort bei: {last_ride + 1}")
+    det.ride_id = evt_logger.ride_id
 
     if args.axis != "auto":
         det.axis = args.axis
         print(f"[i] Hauptachse (fix): {args.axis.upper()}")
-
     if leds and leds.enabled:
         leds.set_state("gestoppt")
 
-    raw_logger = RawLogger(args.log_raw) if args.log_raw else None
-
-    stream_logger = None
-    if (not args.no_stream_logger) and _HAS_STREAM_LOGGER:
-        try:
-            stream_logger = StreamLogger(
-                path=args.log_events, rotate_daily=False, verbose=True,
-            )
-            # --- NEU: seq_idx fortsetzen ---
-            if hasattr(stream_logger, "seq_idx"):
-                stream_logger.seq_idx = last_seq + 1
-                print(f"[i] Setze seq_idx fort bei: {last_seq + 1}")
-        except Exception as e:
-            print(f"[!] StreamLogger-Fehler: {e}")
-
-    model_list = [
-        s.strip() for s in args.anomaly_models.split(",") if s.strip()
-    ]
-    det.anomaly_models = model_list
-    det.stats = {name: {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
-                 for name in model_list}
-
+    # --- Anomaly-Scorer ---
     anomaly_scorer = None
-    if args.anomaly_run_dir is not None:
-        if not _HAS_ANOMALY:
-            print("[!] live_anomaly.py nicht gefunden — Scoring deaktiviert")
-        else:
+    if _HAS_ANOMALY:
+        try:
+            run_dir = resolve_run_dir(
+                args.anomaly_run_dir,
+                preferred_name=args.anomaly_model_name,
+            )
+            print(f"[i] Modell gefunden: {run_dir}")
+            anomaly_scorer = LiveAnomalyScorer(
+                run_dir=run_dir,
+                warmup_csv=args.events_jsonl if args.events_jsonl.exists() else None,
+                verbose=True,
+                threshold_factor=args.threshold_factor,
+                confirmation_events=args.confirmation_events,
+                accept_below_ratio=args.accept_below_ratio,
+            )
+            det.anomaly_scorer = anomaly_scorer
+            print(f"[i] Live-Scoring: AN (TranAD)")
+        except SystemExit as e:
+            print(e)
+            print("[!] Scoring deaktiviert — Events werden trotzdem geloggt.")
+    else:
+        print("[!] live_anomaly.py nicht gefunden — kein Scoring")
+
+    # --- Context-Provider ---
+    def _get_context():
+        ctx = {}
+        if args.context_file and args.context_file.exists():
             try:
-                anomaly_scorer = LiveAnomalyScorer(
-                    run_dir=args.anomaly_run_dir,
-                    models=model_list,
-                    score_log_path=args.score_log,
-                    warmup_csv=args.log_events,
-                    verbose=True,
-                )
-                print(f"[i] Live-Scoring: AN (Modelle: {model_list})")
-                print(f"    Score-Log: {args.score_log}")
-            except SystemExit as e:
-                print(e)
-                anomaly_scorer = None
+                ctx = json.loads(args.context_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return ctx
 
-    if stream_logger is not None:
-        def _on_event(ev, ride_id):
-            seq = stream_logger.seq_idx
-            stream_logger.log_event(ev, ride_id=ride_id)
-            if anomaly_scorer is not None:
-                res = anomaly_scorer.score_event(ev, ride_id, seq_idx=seq)
-                if res is not None:
-                    alerts = [n for n, a in res["alarms"].items() if a]
-                    if alerts:
-                        for n in alerts:
-                            det.report_alarm(n)
-                        c, r = COLORS.get("alarm", ""), COLORS.get("reset", "")
-                        parts = "  ".join(
-                            f"{n}={res['scores'][n]:.4f}" for n in alerts
-                        )
-                        print(f"  {c}[!] ANOMALIE ride=#{ride_id}  {parts}{r}")
-        det.on_event = _on_event
+    # --- Event-Handler: JSONL + Score + CMD ---
+    def _on_event(ev, ride_id):
+        seq = evt_logger.next_seq()
+        ctx = _get_context()
 
-        def _on_abort_marker(ev, ride_id, reason):
-            stream_logger.log_event(ev, ride_id=ride_id)
-        det.on_abort_marker = _on_abort_marker
+        score_info = None
+        if anomaly_scorer is not None:
+            res = anomaly_scorer.score_event(ev, ride_id)
+            score_info = {
+                "score": res["score"],
+                "threshold": res["threshold"],
+                "alarm": res["alarm"],
+                "warming_up": res["warming_up"],
+            }
+            if res["alarm"]:
+                c, r = COLORS.get("alarm", ""), COLORS.get("reset", "")
+                print(f"  {c}[!] ANOMALIE ride=#{ride_id}  "
+                      f"score={res['score']:.4f} "
+                      f"thr={res['threshold']:.4f}{r}")
+                if leds:
+                    leds.flash(StateLEDs.PINS and "fahren", 0.8)
 
-    def _on_ride_end(ride_id, alarm_status, aborted):
+        record = {
+            "kind": "event",
+            "seq_idx": seq,
+            "session_id": evt_logger.session_id,
+            "timestamp_unix": ev.get("end_t", time.time()),
+            "timestamp_iso": datetime.fromtimestamp(
+                ev.get("end_t", time.time())).isoformat(timespec="milliseconds"),
+            "ride_id": ride_id,
+            "event_type": ev.get("type"),
+            "duration_s": ev.get("duration_s"),
+            "env_mean": ev.get("env_mean"),
+            "env_max": ev.get("env_max"),
+            "env_std": ev.get("env_std"),
+            "peak_pos_rel": ev.get("peak_pos_rel"),
+            "n_samples": ev.get("n_samples"),
+            "aborted": ev.get("aborted", 0),
+            "context": ctx,
+            "anomaly": score_info,
+        }
+        evt_logger.log(record)
+    det.on_event = _on_event
+
+    def _on_abort_marker(ev, ride_id, reason):
+        seq = evt_logger.next_seq()
+        evt_logger.log({
+            "kind": "abort_marker",
+            "seq_idx": seq,
+            "session_id": evt_logger.session_id,
+            "timestamp_unix": ev.get("end_t", time.time()),
+            "timestamp_iso": datetime.fromtimestamp(
+                ev.get("end_t", time.time())).isoformat(timespec="milliseconds"),
+            "ride_id": ride_id,
+            "reason": reason,
+            "context": _get_context(),
+        })
+    det.on_abort_marker = _on_abort_marker
+
+    # --- Ride-End: JSONL + CMD-Feedback ---
+    def _on_ride_end(ride_id, summary, aborted):
+        seq = evt_logger.next_seq()
         tag = "ABORT" if aborted else "ENDE"
-        gt = det.ride_ground_truth.get(ride_id, "normal")
 
+        # CMD
         print("\n" + "=" * 62)
         print(f"  FAHRT #{ride_id} — {tag}")
         print("-" * 62)
-        if gt == "nothalt":
-            print(f"  Ground Truth : {COLORS.get('alarm','')}"
-                  f"⚠ NOTHALT (markiert){COLORS['reset']}")
+        if summary is None:
+            print("  (keine gescorten Events)")
         else:
-            print(f"  Ground Truth : ✓ normal")
-
-        for name in model_list:
-            alarm = alarm_status.get(name, False)
-            if not aborted:
-                if gt == "nothalt" and alarm:
-                    det.stats[name]["tp"] += 1
-                    verdict = "True Positive"
-                elif gt == "nothalt" and not alarm:
-                    det.stats[name]["fn"] += 1
-                    verdict = "False Negative"
-                elif gt == "normal" and alarm:
-                    det.stats[name]["fp"] += 1
-                    verdict = "False Positive"
-                else:
-                    det.stats[name]["tn"] += 1
-                    verdict = "True Negative"
-            else:
-                verdict = "(ABORT — keine Wertung)"
-
-            sym = "⚠ ANOMALIE" if alarm else "✓ normal"
-            col = COLORS.get("alarm", "") if alarm else COLORS.get("ok", "")
-            print(f"  {name:<10} : {col}{sym}{COLORS['reset']:<20} → {verdict}")
+            alarmed = summary.get("alarmed", False)
+            verdict = "ANOMAL" if alarmed else "normal"
+            col = COLORS.get("alarm" if alarmed else "ok", "")
+            print(f"  TranAD      : {col}{verdict}{COLORS['reset']}")
+            print(f"  max score   : {summary.get('max_score', 0.0):.4f}")
+            thr = anomaly_scorer.threshold if anomaly_scorer else 0.0
+            print(f"  Schwelle    : {thr:.4f}")
+            print(f"  Events      : {summary.get('n_events', 0)} "
+                  f"({summary.get('n_scored', 0)} gescort)")
+            pool_tag = ("→ in Normal-Pool"
+                        if summary.get("accepted_into_pool")
+                        else "→ verworfen (nicht in Pool)")
+            print(f"  Normal-Pool : {pool_tag}")
         print("=" * 62 + "\n")
 
-        if leds:
-            for name in model_list:
-                leds.set_anomaly_status(name, alarm_status.get(name, False))
-
+        # JSONL
+        evt_logger.log({
+            "kind": "ride_end",
+            "seq_idx": seq,
+            "session_id": evt_logger.session_id,
+            "timestamp_unix": time.time(),
+            "timestamp_iso": datetime.now().isoformat(timespec="milliseconds"),
+            "ride_id": ride_id,
+            "aborted": aborted,
+            "summary": summary,
+            "context": _get_context(),
+        })
     det.on_ride_end = _on_ride_end
 
-    def _force_alarm():
-        for name in model_list:
-            det.report_alarm(name)
-            if leds:
-                leds.set_anomaly_status(name, True)
-
+    # --- Control ---
     def _toggle_pause():
         det.set_paused(not det.paused)
 
@@ -1080,33 +919,22 @@ def main():
         if det.paused:
             det.set_paused(False)
         else:
-            det.set_paused(True)
-            time.sleep(0.05)
-            det.set_paused(False)
+            det.set_paused(True); time.sleep(0.05); det.set_paused(False)
 
-    test_trigger = None
-    if not args.no_trigger:
-        session_id = (getattr(stream_logger, "session_id", None)
-                      if stream_logger else None)
-        test_trigger = TestTrigger(
-            marker_path=args.test_markers,
-            session_id=session_id,
-            enabled=True,
-            on_force_alarm=_force_alarm,
-            on_pause=_toggle_pause,
-            on_reset=_reset_detector,
+    control = None
+    if not args.no_control:
+        control = ControlPanel(
+            enabled=True, on_pause=_toggle_pause, on_reset=_reset_detector,
             use_hardware_buttons=(not args.no_buttons),
         )
-        det.test_trigger = test_trigger
-        if test_trigger.enabled:
-            print(f"[i] Software-Trigger: AN")
-            print(f"    Taste 'n' = nächste Fahrt NOTHALT")
-            print(f"    Taste 'p' = Pause an/aus")
-            print(f"    Taste 'r' = Reset")
-            print(f"    Taste 'a' = manuelle Anomalie (Test)")
+        det.control = control
 
+    # --- Raw-Logger (nur wenn explizit) ---
+    raw_logger = BinaryRawLogger(args.log_raw) if args.log_raw else None
+
+    # --- Mainloop ---
     t_start = time.time()
-    sample_period = 1.0 / cfg["fs"]
+    sample_period = 1.0 / CFG["fs"]
     next_t = t_start
     last_ride_check = t_start
     print(f"\n[i] Starte Streaming...\n")
@@ -1116,62 +944,34 @@ def main():
             now = time.time()
             x, y, z = sensor.read_accel_ms2()
             det.feed(x, y, z, now)
-
             if now - last_ride_check >= 0.2:
                 det.check_ride_end(now)
                 last_ride_check = now
-
-            if leds is not None:
-                leds.update(now)
-            if raw_logger:
-                raw_logger.log(now, now - t_start, x, y, z)
-
+            if leds: leds.update(now)
+            if raw_logger: raw_logger.log(z, now - t_start)
             next_t += sample_period
             sleep = next_t - time.time()
-            if sleep > 0:
-                time.sleep(sleep)
-            else:
-                next_t = time.time()
-
+            if sleep > 0: time.sleep(sleep)
+            else: next_t = time.time()
     except KeyboardInterrupt:
-        print("\n[i] Strg+C — beende Detector.")
-
+        print("\n[i] Strg+C — beende.")
     finally:
-        now = time.time()
         if det.state != "gestoppt" and det.state_start_t is not None:
-            det._write_active_event_on_abort(now, det.ride_id)
+            det._write_active_event_on_abort(time.time(), det.ride_id)
             det._write_abort_marker(det.ride_id, reason="shutdown")
 
         print()
         print("=" * 62)
         print("  Statistik")
         print("=" * 62)
-        print(f"  Fahrten erfolgreich abgeschlossen:  {det.n_rides_ok}")
-        print(f"  Fahrten abgebrochen (ABORT):        {det.n_rides_aborted}")
-        if test_trigger is not None:
-            print(f"  Markierte Testfahrten (Nothalt):    "
-                  f"{len(test_trigger.marked_rides)}")
-
-        print()
-        print("=" * 62)
-        print("  Klassifikations-Statistik (nicht-abortierte Fahrten)")
-        print("=" * 62)
-        print(f"  {'Modell':<10} {'TP':>4} {'FP':>4} {'FN':>4} {'TN':>4}  "
-              f"{'Prec':>6} {'Rec':>6} {'F1':>6}")
-        print("  " + "-" * 60)
-        for name, s in det.stats.items():
-            tp, fp, fn, tn = s["tp"], s["fp"], s["fn"], s["tn"]
-            prec = tp / max(tp + fp, 1)
-            rec = tp / max(tp + fn, 1)
-            f1 = (2 * prec * rec / max(prec + rec, 1e-8)
-                  if (prec + rec) > 0 else 0.0)
-            print(f"  {name:<10} {tp:>4} {fp:>4} {fn:>4} {tn:>4}  "
-                  f"{prec:>6.3f} {rec:>6.3f} {f1:>6.3f}")
+        print(f"  Fahrten abgeschlossen:   {det.n_rides_ok}")
+        print(f"  davon als ANOMAL:        {det.n_rides_anomal}")
+        print(f"  Fahrten abgebrochen:     {det.n_rides_aborted}")
 
         if raw_logger: raw_logger.close()
-        if stream_logger: stream_logger.close()
         if anomaly_scorer: anomaly_scorer.close()
-        if test_trigger: test_trigger.close()
+        evt_logger.close()
+        if control: control.close()
         if leds: leds.close()
         sensor.close()
         print("\n[✓] Beendet.")

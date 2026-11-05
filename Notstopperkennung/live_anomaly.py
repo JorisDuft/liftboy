@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""
-live_anomaly.py — Event-Level Scoring (Sliding Window) mit
-rolling Normal-Pool, Force-Normal-Rides, Pool-Persistenz
-und Anti-Fehlalarm-Logik.
-"""
+import os
 import json
 import csv
-import time
+import math
 from pathlib import Path
 from collections import deque
 import numpy as np
@@ -17,23 +13,115 @@ EVENT_TYPES = ["gestoppt", "anfahren", "fahren", "abbremsen"]
 FEATURE_LEN = 9
 CONTINUOUS_IDX = [4, 5, 6, 7, 8]
 
-from retrain_from_stream import GRUAE, TranAD
+MODEL_NAME = "tranad"
+
+# ======================================================================
+# Modell-Definition (exakt kopiert aus retrain_from_stream.py)
+# ======================================================================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=1000, dropout=0.1):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float() *
+                        -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        return self.dropout(x + self.pe[:, :x.size(1)])
 
 
+class TranAD(nn.Module):
+    def __init__(self, n_features, d_model=64, nhead=4,
+                 nlayers=2, dropout=0.1):
+        super().__init__()
+        self.input_proj = nn.Linear(n_features, d_model)
+        self.pos_enc = PositionalEncoding(d_model, dropout=dropout)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=nlayers)
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=nlayers)
+        self.output_proj = nn.Linear(d_model, n_features)
+
+    def forward(self, x):
+        h = self.pos_enc(self.input_proj(x))
+        memory = self.encoder(h)
+        out = self.decoder(h, memory)
+        return self.output_proj(out)
+
+# ======================================================================
+# Pfad-Auflösung (findet Desktop/models/mittel_w4 automatisch)
+# ======================================================================
+_BASE_DIR = Path(__file__).resolve().parent
+_DEFAULT_MODELS_DIR = _BASE_DIR.parent / "models"
+
+DEFAULT_MODEL_ROOT = Path(os.path.expanduser(
+    os.environ.get("LIFT_MODEL_ROOT", str(_DEFAULT_MODELS_DIR))
+))
+PREFERRED_MODEL_NAME = os.environ.get("LIFT_MODEL_NAME", "mittel_w4")
+
+
+def _is_run_dir(p: Path) -> bool:
+    return (p.is_dir()
+            and (p / "config.json").exists()
+            and (p / "scaler.npz").exists()
+            and (p / f"{MODEL_NAME}.pt").exists()
+            and (p / f"thresholds_{MODEL_NAME}.json").exists())
+
+
+def resolve_run_dir(path=None, preferred_name=None):
+    preferred_name = preferred_name or PREFERRED_MODEL_NAME
+    if path is not None:
+        p = Path(os.path.expanduser(str(path)))
+    else:
+        p = DEFAULT_MODEL_ROOT
+
+    if _is_run_dir(p):
+        return p
+
+    if not p.is_dir():
+        raise SystemExit(f"[!] Modell-Pfad existiert nicht: {p}")
+
+    candidates = [d for d in p.iterdir() if _is_run_dir(d)]
+    if not candidates:
+        raise SystemExit(
+            f"[!] Kein gültiges Run-Dir unter {p}\n"
+            f"    Erwartet pro Subdir: config.json, scaler.npz, "
+            f"{MODEL_NAME}.pt, thresholds_{MODEL_NAME}.json"
+        )
+
+    for c in candidates:
+        if c.name == preferred_name:
+            return c
+    for c in candidates:
+        if (c / "selected.json").exists():
+            return c
+    candidates.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+# ======================================================================
+# Scorer
+# ======================================================================
 class LiveAnomalyScorer:
-    def __init__(self, run_dir, models=("gru_ae",), score_log_path=None,
-                 warmup_csv=None, verbose=False,
-                 threshold_factor=1.0,
+    def __init__(self, run_dir, warmup_csv=None, verbose=False,
+                 threshold_factor=1.5,
                  confirmation_events=1,
-                 force_normal_rides=(2,3),
-                 pool_path=None):
+                 pool_path=None,
+                 accept_below_ratio=0.75):
         self.run_dir = Path(run_dir)
         self.verbose = verbose
         self.threshold_factor = float(threshold_factor)
         self.confirmation_events = max(1, int(confirmation_events))
-        self.force_normal_rides = set(int(r) for r in force_normal_rides)
-        self.pool_path = (Path(pool_path) if pool_path
-                          else self.run_dir / "normal_pool.npy")
+        self.accept_below_ratio = float(accept_below_ratio)
 
         cfg_path = self.run_dir / "config.json"
         sc_path = self.run_dir / "scaler.npz"
@@ -48,146 +136,94 @@ class LiveAnomalyScorer:
         self.mean = sc["mean"]
         self.std = sc["std"]
 
-        self.models = {}
-        self.thresholds = {}
-        self.anomaly_detected = False
+        # --- Modell laden (TranAD) ---
+        ckpt_path = self.run_dir / f"{MODEL_NAME}.pt"
+        if not ckpt_path.exists():
+            raise SystemExit(f"[!] {MODEL_NAME}.pt fehlt in {self.run_dir}")
 
-        for name in models:
-            ckpt_path = self.run_dir / f"{name}.pt"
-            if not ckpt_path.exists():
-                print(f"[!] {name}.pt fehlt in {self.run_dir} — übersprungen")
-                continue
+        ckpt = torch.load(str(ckpt_path), map_location="cpu",
+                          weights_only=False)
+        m_args = ckpt.get("args", {})
+        
+        m = TranAD(
+            ckpt.get("n_features", FEATURE_LEN),
+            d_model=m_args.get("d_model", 32),
+            nhead=m_args.get("nhead", 2),
+            nlayers=m_args.get("nlayers", 1),
+            dropout=m_args.get("dropout", 0.0),
+        )
+        m.load_state_dict(ckpt["state_dict"])
+        m.eval()
+        self.model = m
 
-            ckpt = torch.load(str(ckpt_path), map_location="cpu",
-                              weights_only=False)
-            m_args = ckpt.get("args", {})
+        # --- Threshold ---
+        thr_p = self.run_dir / f"thresholds_{MODEL_NAME}.json"
+        if not thr_p.exists():
+            raise SystemExit(f"[!] thresholds_{MODEL_NAME}.json fehlt")
+        raw_thr = float(json.loads(thr_p.read_text())["threshold"])
+        self.threshold = raw_thr * self.threshold_factor
+        self.accept_threshold = self.threshold * self.accept_below_ratio
+        
+        if self.verbose:
+            print(f"[i] {MODEL_NAME}: base={raw_thr:.4f} → "
+                  f"alarm>{self.threshold:.4f} "
+                  f"(×{self.threshold_factor}), "
+                  f"pool-accept<{self.accept_threshold:.4f}")
 
-            if name == "gru_ae":
-                m = GRUAE(
-                    ckpt.get("n_features", FEATURE_LEN),
-                    hidden=m_args.get("hidden", 32),
-                    latent=m_args.get("latent", 8),
-                    dropout=m_args.get("dropout", 0.0),
-                    max_len=self.window + 50,
-                    pos_emb_scale=m_args.get("pos_emb_scale", 1.0),
-                )
-            elif name == "tranad":
-                m = TranAD(
-                    ckpt.get("n_features", FEATURE_LEN),
-                    d_model=m_args.get("d_model", 64),
-                    nhead=m_args.get("nhead", 4),
-                    nlayers=m_args.get("nlayers", 2),
-                    dropout=m_args.get("dropout", 0.0),
-                )
-            else:
-                print(f"[!] Unbekanntes Modell: {name}")
-                continue
-
-            m.load_state_dict(ckpt["state_dict"])
-            m.eval()
-            self.models[name] = m
-
-            thr_p = self.run_dir / f"thresholds_{name}.json"
-            if thr_p.exists():
-                raw_thr = float(json.loads(thr_p.read_text())["threshold"])
-                self.thresholds[name] = raw_thr * self.threshold_factor
-                if self.verbose and self.threshold_factor != 1.0:
-                    print(f"[i] {name}: threshold {raw_thr:.4f} → "
-                          f"{self.thresholds[name]:.4f} "
-                          f"(× {self.threshold_factor})")
-            else:
-                self.thresholds[name] = float("inf")
-
+        # --- Buffer + Pool ---
         self.buf = deque(maxlen=self.window)
-        self._seq_counter = 0  # Wird gleich aus der CSV überschrieben (falls vorhanden)
-        self.streak = {n: 0 for n in self.models}
-
-        # Rolling-Pool aus Events sauberen Fahrten
+        self.streak = 0
+        self.anomaly_detected = False
         self.normal_pool = deque(maxlen=max(self.window * 2, 16))
+        self.pool_path = (Path(pool_path) if pool_path
+                          else self.run_dir / "normal_pool.npy")
 
-        # Fahrt-Tracking
+        # --- Ride-Tracking ---
         self.current_ride_id = None
         self.current_ride_events = []
-        self.current_ride_dirty = False
-        self.last_normal_ride_id = None
-        self.last_normal_ride_len = 0
+        self.current_ride_max_score = 0.0
+        self.current_ride_alarmed = False
+        self.current_ride_n_scored = 0
 
-        # 1) Persistierten Pool laden (falls vorhanden)
-        loaded_from_disk = False
-        if self.pool_path and self.pool_path.exists():
+        # 1) Persistierten Pool laden
+        loaded = False
+        if self.pool_path.exists():
             try:
                 self.load_pool(self.pool_path)
-                loaded_from_disk = True
+                loaded = True
             except Exception as e:
                 print(f"[!] Pool-Load fehlgeschlagen: {e}")
 
-        # 2) Sonst aus warmup_csv seeden
-        if not loaded_from_disk and warmup_csv and Path(warmup_csv).exists():
-            print(f"[AnomalyScorer] Seed-Normaldaten aus {warmup_csv} ...")
-            try:
-                with open(warmup_csv, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        ev = {
-                            "type": row["event_type"],
-                            "duration_s": float(row["duration_s"]),
-                            "env_mean": float(row["env_mean"]),
-                            "env_max": float(row["env_max"]),
-                            "env_std": float(row["env_std"]),
-                            "peak_pos_rel": float(row["peak_pos_rel"]),
-                        }
-                        self.normal_pool.append(self._feature_vector(ev))
-                for x in list(self.normal_pool)[-self.window:]:
-                    self.buf.append(x)
-                print(f"[AnomalyScorer] Warmup: {len(self.normal_pool)} "
-                      f"Events im Pool, {len(self.buf)} im Puffer.")
-            except Exception as e:
-                print(f"[!] Fehler beim Warmup: {e}")
+        # 2) Sonst aus (kuratierter) warmup_csv seeden
+        if not loaded and warmup_csv and Path(warmup_csv).exists():
+            self._seed_from_csv(Path(warmup_csv))
 
         if not self.normal_pool:
-            print("[i] Normal-Pool leer — wird erst durch saubere Fahrten "
-                  "gefüllt. Force-Normal-Rides helfen beim Bootstrap.")
+            print("[i] Normal-Pool leer — bootstrap aus ersten sauberen "
+                  "Fahrten. Bei Deadlock: --warmup-csv mit kuratiertem "
+                  "Normal-CSV verwenden.")
 
-        # ------------------------------------------------------------------
-        # HIER IST DIE ÄNDERUNG FÜR DIE FORTSETZUNG DES SEQ_IDX
-        # ------------------------------------------------------------------
-        self.score_log_path = Path(score_log_path) if score_log_path else None
-        self._f, self._w = None, None
-        if self.score_log_path:
-            self.score_log_path.parent.mkdir(parents=True, exist_ok=True)
-            is_new = ((not self.score_log_path.exists())
-                      or (self.score_log_path.stat().st_size == 0))
-            
-            # Wenn die Datei schon existiert: Lese den letzten seq_idx aus der CSV
-            if not is_new:
-                try:
-                    with open(self.score_log_path, "r", encoding="utf-8") as f_read:
-                        lines = f_read.readlines()
-                        for line in reversed(lines):
-                            line = line.strip()
-                            if line:
-                                parts = line.split(",")
-                                if parts and parts[0].isdigit():
-                                    self._seq_counter = int(parts[0]) + 1
-                                    print(f"[i] Score-Log existiert bereits. Setze seq_idx fort bei: {self._seq_counter}")
-                                    break
-                except Exception as e:
-                    print(f"[!] Konnte letzten seq_idx nicht lesen: {e}")
+    def _seed_from_csv(self, path):
+        print(f"[AnomalyScorer] Seed-Normaldaten aus {path} ...")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    ev = {
+                        "type": row["event_type"],
+                        "duration_s": float(row["duration_s"]),
+                        "env_mean": float(row["env_mean"]),
+                        "env_max": float(row["env_max"]),
+                        "env_std": float(row["env_std"]),
+                        "peak_pos_rel": float(row["peak_pos_rel"]),
+                    }
+                    self.normal_pool.append(self._feature_vector(ev))
+            for x in list(self.normal_pool)[-self.window:]:
+                self.buf.append(x)
+            print(f"[AnomalyScorer] Warmup: {len(self.normal_pool)} im Pool.")
+        except Exception as e:
+            print(f"[!] Warmup-Fehler: {e}")
 
-            self._f = open(self.score_log_path, "a", newline="")
-            self._w = csv.writer(self._f)
-            if is_new:
-                header = ["seq_idx", "timestamp_unix", "event_type",
-                          "ride_id", "forced"]
-                for name in self.models:
-                    header += [f"score_{name}", f"thr_{name}",
-                               f"alarm_{name}"]
-                self._w.writerow(header)
-                self._f.flush()
-
-    # ------------------------------------------------------------------
-    # Feature-Vektor
-    # ------------------------------------------------------------------
     def _feature_vector(self, ev):
         x = np.zeros((FEATURE_LEN,), dtype=np.float32)
         et = ev.get("type", "")
@@ -201,166 +237,154 @@ class LiveAnomalyScorer:
         x[CONTINUOUS_IDX] = (x[CONTINUOUS_IDX] - self.mean) / self.std
         return x
 
-    # ------------------------------------------------------------------
-    # Ride-Finalisierung + Pool-Aufnahme
-    # ------------------------------------------------------------------
-    def _finalize_previous_ride(self, new_ride_id):
-        if (self.current_ride_id is None
-                or self.current_ride_id == new_ride_id):
-            return
-        forced = self.current_ride_id in self.force_normal_rides
-        clean = (not self.current_ride_dirty) or forced
-        n_events = len(self.current_ride_events)
-
-        if clean and n_events > 0:
+    def _finalize_current_ride(self):
+        if self.current_ride_id is None or not self.current_ride_events:
+            return None
+        n = len(self.current_ride_events)
+        pool_empty = len(self.normal_pool) == 0
+        clean = (not self.current_ride_alarmed
+                 and self.current_ride_max_score < self.accept_threshold
+                 and (pool_empty or self.current_ride_n_scored > 0))
+        if clean:
             for x in self.current_ride_events:
                 self.normal_pool.append(x)
-            self.last_normal_ride_id = self.current_ride_id
-            self.last_normal_ride_len = n_events
+        summary = {
+            "ride_id": self.current_ride_id,
+            "n_events": n,
+            "n_scored": self.current_ride_n_scored,
+            "max_score": self.current_ride_max_score,
+            "alarmed": self.current_ride_alarmed,
+            "accepted_into_pool": clean,
+        }
+        self.current_ride_id = None
+        self.current_ride_events = []
+        self.current_ride_max_score = 0.0
+        self.current_ride_alarmed = False
+        self.current_ride_n_scored = 0
+        return summary
 
-        if forced and self.current_ride_dirty:
-            tag = "FORCED-NORMAL"
-        elif self.current_ride_dirty:
-            tag = "ANOMAL"
-        else:
-            tag = "SAUBER"
+    def finalize_current_ride(self):
+        """Explizit am Fahrt-Ende aufrufen (check_ride_end)."""
+        summary = self._finalize_current_ride()
+        if self.anomaly_detected:
+            self._refill_buffer()
+            self.anomaly_detected = False
+            self.streak = 0
+        return summary
 
-        print(f"[Ride] {self.current_ride_id}: events={n_events} "
-              f"dirty={self.current_ride_dirty} forced={forced} "
-              f"→ {tag} "
-              f"{'AKZEPTIERT' if clean else 'VERWORFEN'} "
-              f"(Pool: {len(self.normal_pool)})")
+    def discard_current_ride(self):
+        """Bei Abbruch — kein Pool-Update."""
+        summary = None
+        if self.current_ride_id is not None and self.current_ride_events:
+            summary = {
+                "ride_id": self.current_ride_id,
+                "n_events": len(self.current_ride_events),
+                "n_scored": self.current_ride_n_scored,
+                "max_score": self.current_ride_max_score,
+                "alarmed": self.current_ride_alarmed,
+                "accepted_into_pool": False,
+                "aborted": True,
+            }
+        self.current_ride_id = None
+        self.current_ride_events = []
+        self.current_ride_max_score = 0.0
+        self.current_ride_alarmed = False
+        self.current_ride_n_scored = 0
+        if self.anomaly_detected:
+            self._refill_buffer()
+            self.anomaly_detected = False
+            self.streak = 0
+        return summary
 
-    def _refill_buffer_from_normals(self):
+    def _refill_buffer(self):
         self.buf.clear()
         if not self.normal_pool:
-            if self.verbose:
-                print("  [Refill] Kein Normal-Pool — Puffer bleibt leer.")
             return False
         for x in list(self.normal_pool)[-self.window:]:
             self.buf.append(x)
-        if self.verbose:
-            src = (f"letzte Normalfahrt {self.last_normal_ride_id}"
-                   if self.last_normal_ride_id is not None else "Pool")
-            print(f"  [Refill] {len(self.buf)}/{self.window} Events "
-                  f"aus {src} in Puffer.")
         return True
 
     def _build_window(self, x):
-        if not self.current_ride_dirty:
+        if not self.current_ride_alarmed:
             self.buf.append(x)
             return list(self.buf)
-        else:
-            combined = list(self.buf) + [x]
-            return combined[-self.window:]
+        return (list(self.buf) + [x])[-self.window:]
 
-    # ------------------------------------------------------------------
-    # Event-Scoring
-    # ------------------------------------------------------------------
-    def score_event(self, ev, ride_id, seq_idx=None):
+    def score_event(self, ev, ride_id):
         ride_id = int(ride_id)
-        forced = ride_id in self.force_normal_rides
+        ride_summary = None
 
-        # 1) Neue Fahrt → alte finalisieren
+        # 1) Neue Fahrt?
         if self.current_ride_id is None or ride_id != self.current_ride_id:
-            self._finalize_previous_ride(ride_id)
+            ride_summary = self._finalize_current_ride()
+            if self.anomaly_detected:
+                self._refill_buffer()
+                self.anomaly_detected = False
+                self.streak = 0
             self.current_ride_id = ride_id
             self.current_ride_events = []
-            self.current_ride_dirty = False
+            self.current_ride_max_score = 0.0
+            self.current_ride_alarmed = False
+            self.current_ride_n_scored = 0
 
-        # 2) Nach Alarm: Puffer aus Normal-Pool auffüllen
-        if self.anomaly_detected:
-            self._refill_buffer_from_normals()
-            self.anomaly_detected = False
-            for k in self.streak:
-                self.streak[k] = 0
-
-        # 3) Feature-Vektor, immer fürs Ride-Tracking
         x = self._feature_vector(ev)
         self.current_ride_events.append(x)
-
-        # 4) Scoring-Fenster
         window_arr = self._build_window(x)
 
-        if seq_idx is None:
-            seq_idx = self._seq_counter
-        self._seq_counter = seq_idx + 1
-
         if len(window_arr) < self.window:
-            return None
+            return {
+                "score": None,
+                "alarm": False,
+                "threshold": self.threshold,
+                "warming_up": True,
+                "ride_summary": ride_summary,
+            }
 
         W = np.stack(window_arr).astype(np.float32)[None, :, :]
         t = torch.from_numpy(W)
-
-        result = {
-            "seq_idx": seq_idx,
-            "ride_id": ride_id,
-            "forced": forced,
-            "scores": {},
-            "alarms": {},
-        }
-
         with torch.no_grad():
-            for name, m in self.models.items():
-                r = m(t)
-                s = float(((r - t) ** 2).mean().item())
-                result["scores"][name] = s
+            r = self.model(t)
+            s = float(((r - t) ** 2).mean().item())
 
-                if forced:
-                    result["alarms"][name] = False
-                    self.streak[name] = 0
-                else:
-                    if s > self.thresholds[name]:
-                        self.streak[name] += 1
-                    else:
-                        self.streak[name] = 0
-                    result["alarms"][name] = (
-                        self.streak[name] >= self.confirmation_events
-                    )
+        self.current_ride_n_scored += 1
+        if s > self.current_ride_max_score:
+            self.current_ride_max_score = s
 
-        # 5) State-Update (nicht für force-normal-Rides)
-        if not forced and any(result["alarms"].values()):
-            self.current_ride_dirty = True
+        self.streak = self.streak + 1 if s > self.threshold else 0
+        alarm = self.streak >= self.confirmation_events
+        if alarm:
+            self.current_ride_alarmed = True
             self.anomaly_detected = True
 
-        # 6) Log
-        if self._w is not None:
-            row = [seq_idx, f"{ev.get('start_t', time.time()):.6f}",
-                   ev.get("type", ""), ride_id, int(forced)]
-            for name in self.models:
-                row.append(f"{result['scores'].get(name, 0.0):.6f}")
-                row.append(f"{self.thresholds.get(name, 0.0):.6f}")
-                row.append(int(result["alarms"].get(name, False)))
-            self._w.writerow(row)
-            self._f.flush()
+        return {
+            "score": s,
+            "alarm": alarm,
+            "threshold": self.threshold,
+            "warming_up": False,
+            "ride_summary": ride_summary,
+        }
 
-        return result
-
-    # ------------------------------------------------------------------
-    # Pool-Persistenz
-    # ------------------------------------------------------------------
     def save_pool(self, path=None):
         path = Path(path) if path else self.pool_path
         if not self.normal_pool:
-            print("[i] Pool leer — nichts zu speichern.")
             return
         arr = np.stack(list(self.normal_pool)).astype(np.float32)
         np.save(str(path), arr)
-        print(f"[Pool] {len(arr)} Events gespeichert → {path}")
+        if self.verbose:
+            print(f"[Pool] {len(arr)} Events → {path}")
 
     def load_pool(self, path=None):
         path = Path(path) if path else self.pool_path
         arr = np.load(str(path))
         if arr.ndim != 2 or arr.shape[1] != FEATURE_LEN:
-            raise ValueError(f"Pool-Form {arr.shape} passt nicht zu "
-                             f"({FEATURE_LEN} features)")
+            raise ValueError(f"Pool-Form {arr.shape} ungültig")
         for x in arr[-self.normal_pool.maxlen:]:
             self.normal_pool.append(x.astype(np.float32))
         if self.normal_pool:
             for x in list(self.normal_pool)[-self.window:]:
                 self.buf.append(x)
-        print(f"[Pool] {len(self.normal_pool)} Events geladen aus {path} "
-              f"(Puffer: {len(self.buf)}/{self.window}).")
+        if self.verbose:
+            print(f"[Pool] {len(self.normal_pool)} Events ← {path}")
 
     def close(self):
         if self.pool_path and self.normal_pool:
@@ -368,6 +392,3 @@ class LiveAnomalyScorer:
                 self.save_pool(self.pool_path)
             except Exception as e:
                 print(f"[!] Pool-Save fehlgeschlagen: {e}")
-        if self._f and not self._f.closed:
-            self._f.flush()
-            self._f.close()
