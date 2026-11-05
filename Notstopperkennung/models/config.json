@@ -1,0 +1,37 @@
+{
+  "window": 4,
+  "stride": 1,
+  "n_features": 9,
+  "feature_names": [
+    "is_gestoppt",
+    "is_anfahren",
+    "is_fahren",
+    "is_abbremsen",
+    "duration_s",
+    "env_mean",
+    "env_max",
+    "env_std",
+    "peak_pos_rel"
+  ],
+  "event_types": [
+    "gestoppt",
+    "anfahren",
+    "fahren",
+    "abbremsen"
+  ],
+  "continuous_idx": [
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "trained_on": "C:\\Users\\peter\\OneDrive\\Desktop\\Studium\\F\u00e4cher\\BAT\\Datens\u00e4tze\\Beschl\u00e4unigung\\Train_live\\stream_events_13bis15-10-26_clean.csv",
+  "n_events_total": 1205,
+  "n_windows_total": 1202,
+  "n_windows_train": 958,
+  "n_windows_val": 240,
+  "seed": 42,
+  "pos_emb_scale": 0.1,
+  "variance_weight": 0.0
+}

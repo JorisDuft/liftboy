@@ -1,0 +1,14 @@
+{
+  "percentile": 95.0,
+  "threshold": 0.0009507506038062274,
+  "val_score_min": 9.208745177602395e-05,
+  "val_score_median": 0.0004723695747088641,
+  "val_score_max": 0.0014018719084560871,
+  "val_score_spread": 15.223267555236816,
+  "best_val_mse": 0.000500018842285499,
+  "n_windows_train": 958,
+  "n_windows_val": 240,
+  "n_params": 12229,
+  "variance_weight": 0.0,
+  "pos_emb_scale": 0.1
+}
