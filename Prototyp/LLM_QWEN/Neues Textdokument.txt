@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""
+llm_daemon.py — Lauscht fortlaufend an der events.jsonl.
+Gibt alle physikalischen Werte an Qwen weiter, aber nur bei Anomalien.
+"""
+import argparse
+import json
+import time
+from pathlib import Path
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+def build_context(current_ride_events, ride_summary, ride_id):
+    """Baut den Text-Kontext aus ALLEN Event-Daten der aktuellen Fahrt."""
+    if not current_ride_events:
+        return "Keine Event-Details verfügbar."
+    
+    text = f"--- FAHRT #{ride_id} DATEN ---\n"
+    for ev in current_ride_events:
+        ev_type = ev.get("event_type")
+        dur = ev.get("duration_s", 0.0)
+        e_mean = ev.get("env_mean", 0.0)
+        e_max = ev.get("env_max", 0.0)
+        e_std = ev.get("env_std", 0.0)
+        peak = ev.get("peak_pos_rel", 0.0)
+        
+        anomaly = ev.get("anomaly")
+        anom_str = " [normal]"
+        if anomaly:
+            if anomaly.get("alarm"):
+                anom_str = f" [ANOMALIE! Score={anomaly['score']:.4f} > Limit={anomaly['threshold']:.4f}]"
+            elif anomaly.get("warming_up"):
+                anom_str = " [Modell lernt noch]"
+                
+        text += f"- {ev_type} (Dauer: {dur:.2f}s): mean={e_mean:.4f}, max={e_max:.4f}, std={e_std:.4f}, peak_pos={peak:.3f}{anom_str}\n"
+    
+    text += "\n--- TRANAD FAHRT-BEWERTUNG ---\n"
+    if ride_summary:
+        status = "ANOMAL" if ride_summary.get("alarmed") else "normal"
+        text += f"Gesamturteil: {status}\n"
+        text += f"Maximaler Fehler-Score der Fahrt: {ride_summary.get('max_score', 0.0):.4f}\n"
+        text += f"Schwelle für Alarm: {ride_summary.get('threshold', 0.0):.4f}\n"
+    
+    return text
+
+def main():
+    ap = argparse.ArgumentParser(description="Fortlaufender Qwen LLM Analyzer")
+    ap.add_argument("--model-path", type=str, required=True, help="Pfad zum Qwen-Modell")
+    ap.add_argument("--events-jsonl", type=Path, default=Path("../live_data/raw/events.jsonl"))
+    ap.add_argument("--system-prompt", type=str, 
+                    default="Du bist ein Sicherheitsexperte für Aufzüge. "
+                            "Du bekommst die Sensordaten einer Aufzugsfahrt. "
+                            "Analysiere die Werte und erkläre kurz und präzise, "
+                            "warum das KI-Modell (TranAD) diese Fahrt als Anomalie eingestuft hat. "
+                            "Achte besonders auf hohe Vibrationen (env_max, env_std) oder ungewöhnliche Zeiten.")
+    ap.add_argument("--user-prompt", type=str, 
+                    default="Analysiere diese anomale Fahrt und nenne die wahrscheinlichste Ursache für den Nothalt.")
+    
+    args = ap.parse_args()
+
+    print(f"[i] Lade Modell von {args.model_path}... (Bitte warten)")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path, device_map="cpu", torch_dtype=torch.float32, trust_remote_code=True
+    )
+    print("[✓] Modell geladen. Lausche auf neue Events in der JSONL...\n")
+
+    while not args.events_jsonl.exists():
+        time.sleep(1)
+
+    current_ride_events = []
+    current_ride_id = None
+
+    with open(args.events_jsonl, "r", encoding="utf-8") as f:
+        # Springe ans Ende der Datei (ignoriere alte Daten beim Start)
+        f.seek(0, 2) 
+        
+        while True:
+            line = f.readline()
+            if not line:
+                time.sleep(0.5) # Warte auf neue Daten
+                continue
+            
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            # 1. Einzelnes Event einsammeln
+            if rec.get("kind") == "event":
+                rid = rec.get("ride_id")
+                if rid != current_ride_id:
+                    current_ride_id = rid
+                    current_ride_events = []
+                current_ride_events.append(rec)
+
+            # 2. Fahrt beendet -> Auswerten!
+            elif rec.get("kind") == "ride_end":
+                rid = rec.get("ride_id")
+                summary = rec.get("summary", {})
+                alarmed = summary.get("alarmed", False)
+                
+                # TRIGGER: Nur wenn die Fahrt als anormal markiert wurde!
+                if alarmed:
+                    print(f"\n[{time.strftime('%H:%M:%S')}] 🔔 Anomalie in Fahrt #{rid} erkannt! Analysiere...")
+                    
+                    context_text = build_context(current_ride_events, summary, rid)
+                    
+                    prompt = (
+                        f"<|im_start|>system\n{args.system_prompt}<|im_end|>\n"
+                        f"<|im_start|>user\nHier sind die Daten der anomalen Fahrt:\n\n"
+                        f"{context_text}\n\n"
+                        f"Aufgabe: {args.user_prompt}<|im_end|>\n"
+                        f"<|im_start|>assistant\n"
+                    )
+                    
+                    inputs = tokenizer(prompt, return_tensors="pt")
+                    with torch.no_grad():
+                        generated_ids = model.generate(
+                            inputs.input_ids, max_new_tokens=256, temperature=0.7,
+                            do_sample=True, pad_token_id=tokenizer.eos_token_id
+                        )
+                    
+                    response_ids = generated_ids[0][inputs.input_ids.shape[1]:]
+                    response = tokenizer.decode(response_ids, skip_special_tokens=True)
+                    
+                    print("\n" + "*"*50)
+                    print("  ANTWORT VON QWEN:")
+                    print("*"*50)
+                    print(response.strip())
+                    print("*"*50 + "\n")
+                else:
+                    print(f"[{time.strftime('%H:%M:%S')}] Fahrt #{rid} war normal. (Ignoriert)")
+
+                # Buffer für die nächste Fahrt leeren
+                current_ride_events = []
+                current_ride_id = None
+
+if __name__ == "__main__":
+    main()
